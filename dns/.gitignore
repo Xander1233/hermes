@@ -1,0 +1,6 @@
+/target
+/logs
+/crashes
+server.toml
+zones.toml
+.idea/
