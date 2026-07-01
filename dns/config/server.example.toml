@@ -1,0 +1,119 @@
+# Configuration for the Hermes DNS server process.
+# (DNS data — zones and records — lives in zones.toml.)
+
+[network]
+# Address and port to bind the UDP and TCP listeners to.
+# Port 53 is the standard DNS port but requires elevated privileges; 5353 is handy for dev.
+address = "127.0.0.1"
+port = 53
+
+# Which transports to serve queries over.
+udp = true
+tcp = true
+
+# Number of async worker threads. 0 means "one per CPU core".
+workers = 0
+
+# Number of UDP sockets to bind. On Linux these share the port via SO_REUSEPORT so the
+# kernel load-balances incoming datagrams across them (raise this for deployments; 0 = one
+# per CPU core). Ignored on Windows, which always uses a single socket.
+udp_sockets = 1
+
+# TCP listen backlog.
+tcp_backlog = 1024
+
+[telemetry]
+# Log level used when RUST_LOG is not set: trace | debug | info | warn | error.
+level = "info"
+
+# Console/file log format: "pretty" (dev) or "json" (aggregation).
+log_format = "pretty"
+
+# Logs are written to rotating daily files under this directory (created if missing).
+logs_dir = "logs"
+file_logging = true
+log_file_prefix = "hermes"
+
+# OTLP/gRPC endpoint of an LGTM (Loki/Grafana/Tempo/Mimir) collector — e.g. Grafana Alloy
+# or an OpenTelemetry Collector. Traces and metrics are exported here; leave unset to
+# disable export (console + file logging still work).
+otlp_endpoint = "http://alloy.example.com"
+service_name = "hermes"
+trace_sample_ratio = 1.0
+
+# How often metrics are pushed to the collector, in seconds. Caps the time resolution of
+# every metric graph — counters increment in real time in-process, but the dashboard only
+# moves once per push, so a large value renders as a staircase. 10s matches a typical
+# Prometheus scrape; the OpenTelemetry default is 60. Lower values cost more CPU/network per
+# export for little dashboard benefit.
+metric_export_interval_secs = 10
+
+[rate_limit]
+# Response rate limiting (RRL). On a public address this is what stops the server being used
+# as a DDoS amplification reflector — an attacker sending small queries with a forged source
+# address so we spray large replies at a victim. UDP only; TCP cannot be spoofed.
+enabled = true
+
+# Rates are per client *prefix* and per response class, not per address: spoofed sources are
+# scattered across a subnet, so per-address buckets would never fill.
+responses_per_second = 15
+
+# Total responses per second per client prefix, across every name and class. This is the
+# catch-all: responses_per_second keys on the question name, so a flood of *distinct* names
+# each gets its own budget — and against a zone with a wildcard, a random-subdomain attack is
+# answered NOERROR with a unique name every time and slips straight past it. Set this above
+# the busiest legitimate resolver farm you serve (one large public resolver can occupy a
+# single /24) and well below flood volume. 0 disables it.
+all_per_second = 100
+
+# Tighter, because random-subdomain floods against a zone *without* a wildcard land here and
+# legitimate traffic produces few.
+nxdomains_per_second = 5
+errors_per_second = 5
+
+# Burst window in seconds; a bucket holds rate x window.
+window_secs = 15
+
+# Send every Nth over-limit response truncated so a genuine resolver retries over TCP.
+# 0 = drop everything (maximum protection, breaks real clients under attack), 1 = always.
+slip = 2
+
+# How clients are grouped. /24 and /56 are the conventional choices.
+ipv4_prefix_len = 24
+ipv6_prefix_len = 56
+
+# Fixed number of buckets, so a spoofed flood cannot grow it into a memory-exhaustion vector.
+table_size = 8192
+
+# Never limited: loopback, monitoring, the management plane.
+exempt = [ "127.0.0.0/8", "::1/128" ]
+
+[resolver]
+# Upstream resolvers are used for flattening zone-apex CNAMEs
+upstreams = [ "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4" ]
+timeout_ms = 3000
+
+[zone_sync]
+# Enable the zone sync feature, which allows the DNS server to fetch zone data from the management backend.
+enabled = true
+
+# Base URL and version of the zone sync API exposed by the management backend. Poll updates go through this endpoint.
+base_url = "http://127.0.0.1:5000/sync/v1"
+
+# Hardcoded token that must match the configuration in the management backend.
+# Used for authenticating the DNS server when it polls for zone updates.
+auth_token = "Test123"
+
+poll_interval_secs = 15
+request_timeout_ms = 5000
+fetch_concurrency = 16
+
+# Path to the local snapshot file. Used to restore last known zone data on startup. Is updated after every successful poll from the management backend.
+snapshot_path = "data/zones-snapshot.json"
+
+# Push based API is exposed on this address and port. The management backend uses this to push updates to the DNS server.
+admin_listen = "127.0.0.1:8080"
+
+# Hardcoded token that must match the configuration in the management backend.
+Used for authenticating the management backend when it pushes zone updates to the DNS server.
+admin_token = "Test_Token"
