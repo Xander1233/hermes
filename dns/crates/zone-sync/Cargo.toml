@@ -1,0 +1,19 @@
+[package]
+name = "zone-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dns-types = { path = "../dns-types" }
+hermes-config = { path = "../config" }
+telemetry = { path = "../telemetry" }
+tokio.workspace = true
+reqwest.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
