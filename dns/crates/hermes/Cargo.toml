@@ -1,0 +1,20 @@
+[package]
+name = "hermes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hermes-config = { path = "../config" }
+dns-server = { path = "../dns-server" }
+telemetry = { path = "../telemetry" }
+dns-types = { path = "../dns-types" }
+alias-resolver = { path = "../alias-resolver" }
+zone-sync = { path = "../zone-sync" }
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+opentelemetry.workspace = true
+anyhow.workspace = true
