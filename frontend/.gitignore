@@ -1,0 +1,14 @@
+.DS_Store
+.env*
+!.env.example
+node_modules
+
+# React Router
+.react-router
+build
+
+# typescript
+*.tsbuildinfo
+
+.impeccable
+PRODUCT.md
