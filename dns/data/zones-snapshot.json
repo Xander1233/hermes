@@ -1,0 +1,46 @@
+{
+  "manifest_version": 6,
+  "zones": [
+    {
+      "id": "zone_be2dc35d9cce",
+      "apex": "example.com",
+      "version": 6,
+      "soa": {
+        "mname": "ns1.hermes-dns.net",
+        "rname": "hostmaster.example.com",
+        "serial": 1785039689,
+        "refresh": 3600,
+        "retry": 600,
+        "expire": 604800,
+        "minimum": 60,
+        "ttl": 3600
+      },
+      "records": [
+        {
+          "name": "example.com",
+          "type": "A",
+          "ttl": 300,
+          "data": "192.0.0.1",
+          "preference": null,
+          "priority": null,
+          "weight": null,
+          "port": null,
+          "flags": null,
+          "tag": null
+        },
+        {
+          "name": "www.example.com",
+          "type": "A",
+          "ttl": 300,
+          "data": "192.0.0.1",
+          "preference": null,
+          "priority": null,
+          "weight": null,
+          "port": null,
+          "flags": null,
+          "tag": null
+        }
+      ]
+    }
+  ]
+}
