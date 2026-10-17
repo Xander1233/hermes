@@ -39,7 +39,7 @@ fn run() -> anyhow::Result<()> {
         .with_context(|| format!("loading zones from {}", zones_path.display()))?;
 
     let runtime = runtime::build(&server_config.network)?;
-    let _telemetry = observability::init(&runtime, &server_config)?;
+    // let _telemetry = observability::init(&runtime, &server_config)?;
 
     let build = BuildInfo::CURRENT;
     tracing::info!(version = build.version, commit = build.git_commit, profile = build.profile, "starting Hermes");

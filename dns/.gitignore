@@ -4,3 +4,4 @@
 server.toml
 zones.toml
 .idea/
+.env

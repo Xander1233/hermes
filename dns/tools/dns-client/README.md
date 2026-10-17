@@ -65,39 +65,74 @@ www.example.com.  300  IN  A  93.184.216.34
 
 ## Benchmark / stress test
 
-`npm run bench` fires many queries per second with randomized names and record types, then
-reports throughput and latency percentiles. UDP mode multiplexes many in-flight queries over
-a single socket (matched by transaction ID), so it can push tens of thousands of q/s.
+`npm run bench` fires queries at the server and reports throughput and latency percentiles.
+
+It is built so that the generator is not the thing being measured. Load is spread over worker
+threads, queries are encoded once into a pool at startup rather than per query, in-flight state
+lives in flat typed arrays instead of a Map, and latencies go into a bucketed histogram instead
+of a sampled-and-sorted array. Every run ends with a **load generator health** block, so a
+client-bound result is visible instead of being mistaken for a slow server.
 
 ```sh
-npm run bench                                   # 10s, UDP, flat-out
-npm run bench -- --duration 15 --concurrency 300
-npm run bench -- --qps 5000 --duration 30       # rate-limited to 5000 q/s
-npm run bench -- --count 100000                 # send exactly 100k queries
-npm run bench -- --transport tcp --concurrency 20
-npm run bench -- --help                         # all options
+npm run bench                                     # 10s UDP, 4 workers, 1024 in flight
+npm run bench -- --duration 30 --concurrency 4096
+npm run bench -- --qps 50000 --duration 30        # paced instead of flat out
+npm run bench -- --transport tcp --concurrency 64 --pipeline 64
+npm run bench -- --count 200000                   # exactly 200k measured queries
+npm run bench -- --help                           # all options
 ```
 
 Key options: `--server`, `--port`, `--transport udp|tcp`, `--duration <sec>` / `--count <n>`,
-`--concurrency <n>`, `--qps <n>` (UDP), `--timeout <ms>`, `--domain`, `--names a,b,c`,
+`--warmup <sec>`, `--workers <n>`, `--concurrency <n>`, `--sockets <n>` (UDP),
+`--pipeline <n>` (TCP), `--qps <n>` (UDP), `--timeout <ms>`, `--domain`, `--names a,b,c`,
 `--types A,AAAA,MX`, `--random-ratio <0..1>`. By default 30% of queries hit a random subdomain
-(to exercise NXDOMAIN); the rest hit the shipped `example.com` zone names.
+(to exercise NXDOMAIN); the rest hit the shipped `example.com` zone names. The first two
+seconds are warmup and are thrown away, so JIT warmup does not land in the percentiles.
+
+UDP spreads traffic over several connected sockets per worker (`--sockets`). That is not
+cosmetic: the server binds its listeners with `SO_REUSEPORT` and the kernel picks one by
+hashing the 4-tuple, so a single client socket is one flow and would pin an entire run to one
+of the server's receive loops. TCP keeps its connections open and pipelines queries down them
+(RFC 7766) rather than paying a handshake per query. That is not only faster, it stops the
+generator burning one ephemeral port per query: a connect-per-query client drains the whole
+local port range in seconds and then spends the run measuring its own connect failures. A
+sustained TCP run here holds well under a hundred sockets in `TIME_WAIT`.
 
 Example output:
 
 ```
 === Benchmark results ===
 transport   : udp
-target      : 127.0.0.1:5353
-duration    : 5.00 s
-sent        : 224393
-completed   : 224393
+target      : 127.0.0.1:53
+duration    : 8.04 s
+sent        : 1180318
+completed   : 1180318
 timeouts    : 0
 errors      : 0
-throughput  : 44866 q/s
-latency (ms): min 0.92  avg 4.45  p50 4.18  p90 5.64  p99 8.03  max 10.79
-rcodes      : NOERROR 157307, NXDOMAIN 67086
+throughput  : 146818 q/s
+latency (ms): min 4.86  avg 6.59  p50 6.53  p90 7.30  p99 7.81  p99.9 8.45  max 9.72
+rcodes      : NOERROR 1180318
+
+--- load generator health ---
+workers     : 4  sockets 16
+event-loop  : max lag 7.0 ms, avg 0.07 ms
+in-flight   : avg 872 of 1024 (85% full)
 ```
+
+An `avg 0.07 ms` event loop and an in-flight window that never pinned mean this run is the
+server's number, not the client's. When something does look off, the report says so in a
+`notes:` block rather than leaving you to infer it.
+
+### Reading the health block
+
+- **event-loop lag** is the generator's own stall time. Single-digit milliseconds means the
+  latencies above are the server's. Tens of milliseconds means they include time queued inside
+  this process, and the run needs more `--workers`.
+- **in-flight fill** says which side set the pace. Near 100% with a healthy client means the
+  server was saturated, so throughput is its service rate and the latency is mostly queueing
+  (Little's law: `latency ≈ concurrency / throughput`). Raising `--concurrency` from there only
+  raises latency. Well under the ceiling means the server kept up and the figure is a
+  client-side send rate.
 
 Press Ctrl-C to stop early and still get the report.
 
