@@ -67,6 +67,7 @@ jobs:
       stable: ${{ steps.resolve.outputs.stable }}
     steps:
       - name: Resolve and check the version
+        id: resolve
         env:
           INPUT_VERSION: ${{ inputs.version }}
           BRANCH: ${{ github.ref_name }}
@@ -475,6 +476,15 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
+
+          # An expression that does not resolve yields an empty string rather than an error, so
+          # a missing step id upstream would otherwise show up as oddly named assets and a
+          # confusing `gh release create` usage dump.
+          if [ -z "$TAG" ]; then
+            echo "::error::No tag reached this job — the prepare job's outputs are empty."
+            exit 1
+          fi
+
           cd assets
           chmod +x hermes
           mv hermes "hermes-dns-${TAG}-x86_64-linux"
