@@ -56,6 +56,12 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                 ["ZoneSyncApi:Token"] = ZoneSyncToken,
                 ["Delegation:Enabled"] = "false",
                 ["Cache:Provider"] = "None",
+                // ZoneDefaults has no usable defaults in code: Nameservers is [MinLength(1)]
+                // and validated on start, so the host refuses to boot without it. It has to be
+                // set here rather than left to appsettings.json, which is gitignored and so
+                // absent on CI.
+                ["ZoneDefaults:Nameservers:0"] = "ns1.test.invalid",
+                ["ZoneDefaults:Nameservers:1"] = "ns2.test.invalid",
                 // Present only so the JwtBearer handler can be constructed; the test auth
                 // scheme below is what actually runs.
                 ["Cognito:Region"] = "eu-central-1",

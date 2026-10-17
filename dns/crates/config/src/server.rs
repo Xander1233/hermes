@@ -193,8 +193,9 @@ mod tests {
 
     #[test]
     fn shipped_server_config_is_valid() {
-        // Guards the example config/server.toml against parser drift.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/server.toml");
-        ServerConfig::load(path).expect("shipped server.toml must parse");
+        // Guards the example config against parser drift. It has to be the .example file:
+        // config/server.toml is gitignored local config and so absent from a clean checkout.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/server.example.toml");
+        ServerConfig::load(path).expect("shipped server.example.toml must parse");
     }
 }

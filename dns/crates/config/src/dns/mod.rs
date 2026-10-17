@@ -240,9 +240,10 @@ mod tests {
 
     #[test]
     fn shipped_zones_config_parses_and_builds() {
-        // Guards the example config/zones.toml against parser/record drift.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/zones.toml");
-        let config = DnsConfig::load(path).expect("shipped zones.toml must parse");
-        config.build_zones().expect("shipped zones.toml must build");
+        // Guards the example config against parser/record drift. It has to be the .example
+        // file: config/zones.toml is gitignored local config and so absent from a clean checkout.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/zones.example.toml");
+        let config = DnsConfig::load(path).expect("shipped zones.example.toml must parse");
+        config.build_zones().expect("shipped zones.example.toml must build");
     }
 }

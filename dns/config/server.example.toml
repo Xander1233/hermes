@@ -115,5 +115,5 @@ snapshot_path = "data/zones-snapshot.json"
 admin_listen = "127.0.0.1:8080"
 
 # Hardcoded token that must match the configuration in the management backend.
-Used for authenticating the management backend when it pushes zone updates to the DNS server.
+# Used for authenticating the management backend when it pushes zone updates to the DNS server.
 admin_token = "Test_Token"
