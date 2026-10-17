@@ -1,0 +1,438 @@
+# Tests, container images and releases for the three Hermes components.
+#
+# On every push and pull request: the Rust DNS workspace and the .NET management backend are
+# tested, then all three container images (DNS, management API, dashboard) are built and the
+# frontend is bundled separately as a zip. Images are pushed to GHCR on anything that is not a
+# pull request (a fork's token cannot write packages anyway).
+#
+# Pushing a `v*` tag additionally publishes a GitHub release carrying the Linux DNS binary and a
+# zip of the built frontend. The binary is lifted out of the image that was just pushed, so the
+# release and the image are the same build rather than two compiles that happen to agree.
+name: CI & Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  # docker/metadata-action lowercases these, which matters here: the owner is `Xander1233` and
+  # GHCR only accepts lowercase image names.
+  DNS_IMAGE: ${{ github.repository }}/dns
+  MGMT_IMAGE: ${{ github.repository }}/management
+  FRONTEND_IMAGE: ${{ github.repository }}/frontend
+  # Matches `rust-version` in dns/Cargo.toml and the builder image in dns/Dockerfile.
+  RUST_VERSION: "1.93.0"
+  DOTNET_VERSION: "10.0.x"
+  NODE_VERSION: "22"
+  CARGO_TERM_COLOR: always
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  # --- 1. Tests -------------------------------------------------------------------------------
+  test-dns:
+    name: Test DNS crates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dns
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dns
+
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  test-management:
+    name: Test management backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: management-backend
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # setup-dotnet's own cache wants a packages.lock.json, which this solution does not use,
+      # so key the package cache off the project files instead.
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('management-backend/**/*.csproj', 'management-backend/Directory.Build.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Restore
+        run: dotnet restore Hermes.Mgmt.slnx
+
+      # Release, because Directory.Build.props turns warnings into errors and that is the
+      # configuration the image is published from.
+      - name: Build
+        run: dotnet build Hermes.Mgmt.slnx -c Release --no-restore
+
+      # No LogFileName: the three test projects run in parallel and would otherwise race for the
+      # same .trx. Left to itself the logger names each file after its assembly.
+      - name: Test
+        run: dotnet test Hermes.Mgmt.slnx -c Release --no-build --logger trx --results-directory ../test-results
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: management-test-results
+          path: test-results
+          if-no-files-found: ignore
+
+  # --- 2. Images ------------------------------------------------------------------------------
+  build-dns-image:
+    name: Build & push DNS image
+    needs: test-dns
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.DNS_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=Hermes DNS
+            org.opencontainers.image.description=Hermes authoritative DNS server
+
+      # `load` only, deliberately: buildx refuses to export to the local daemon and to a registry
+      # in the same build, and the release binary has to come out of this image rather than from a
+      # second compile. The image is pushed from the daemon further down, so the binary attached
+      # to the release and the published image are the same build.
+      #
+      # linux/amd64 only: cross-building this workspace under QEMU costs far more than an arm64
+      # image is currently worth.
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: dns
+          platforms: linux/amd64
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=dns
+          cache-to: type=gha,scope=dns,mode=max
+
+      - name: Extract the hermes binary
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          set -euo pipefail
+          container=$(docker create "$IMAGE")
+          docker cp "$container:/usr/local/bin/hermes" hermes
+          docker rm --force "$container" > /dev/null
+          chmod +x hermes
+          file hermes
+          sha256sum hermes
+
+      - name: Push the image
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "::group::push $tag"
+            docker push "$tag"
+            echo "::endgroup::"
+          done <<< "$TAGS"
+
+      # Note: upload-artifact zips its payload and the executable bit does not survive, so the
+      # release job sets it again after downloading.
+      - name: Upload the DNS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-dns-linux-x86_64
+          path: hermes
+          if-no-files-found: error
+          retention-days: 7
+
+  build-management-image:
+    name: Build & push management image
+    needs: test-management
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.MGMT_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=Hermes management API
+            org.opencontainers.image.description=Hermes management backend serving the dashboard and the DNS fleet
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: management-backend
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=management
+          cache-to: type=gha,scope=management,mode=max
+
+  build-frontend-image:
+    name: Build & push frontend image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=Hermes dashboard
+            org.opencontainers.image.description=Hermes management dashboard, server-rendered by react-router-serve
+
+      # This image runs its own `npm run build` inside the Dockerfile, so it does not reuse the
+      # bundle from build-frontend. The VITE_* values are inlined into the client bundle at build
+      # time, so they go in as build args; same repository variables as the zip job, and anything
+      # left unset falls back to the defaults in app/lib/config.ts. Build args are visible in the
+      # image history and in the shipped JS, so none of these may be a secret.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VITE_USE_MOCK_API=${{ vars.VITE_USE_MOCK_API }}
+            VITE_API_BASE_URL=${{ vars.VITE_API_BASE_URL }}
+            VITE_COGNITO_REGION=${{ vars.VITE_COGNITO_REGION }}
+            VITE_COGNITO_USER_POOL_ID=${{ vars.VITE_COGNITO_USER_POOL_ID }}
+            VITE_COGNITO_CLIENT_ID=${{ vars.VITE_COGNITO_CLIENT_ID }}
+            VITE_COGNITO_DOMAIN=${{ vars.VITE_COGNITO_DOMAIN }}
+            VITE_COGNITO_REDIRECT_URI=${{ vars.VITE_COGNITO_REDIRECT_URI }}
+            VITE_COGNITO_LOGOUT_URI=${{ vars.VITE_COGNITO_LOGOUT_URI }}
+            VITE_COGNITO_SCOPES=${{ vars.VITE_COGNITO_SCOPES }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+  # --- 3. Frontend bundle ---------------------------------------------------------------------
+  build-frontend:
+    name: Build frontend bundle
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Every VITE_* value is baked into the client bundle at build time, so they have to be set
+      # here rather than at deploy time. Set them as repository variables; anything left unset
+      # falls back to the defaults in app/lib/config.ts (mock API, localhost URLs).
+      - name: Build
+        run: npm run build
+        env:
+          VITE_USE_MOCK_API: ${{ vars.VITE_USE_MOCK_API }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_COGNITO_REGION: ${{ vars.VITE_COGNITO_REGION }}
+          VITE_COGNITO_USER_POOL_ID: ${{ vars.VITE_COGNITO_USER_POOL_ID }}
+          VITE_COGNITO_CLIENT_ID: ${{ vars.VITE_COGNITO_CLIENT_ID }}
+          VITE_COGNITO_DOMAIN: ${{ vars.VITE_COGNITO_DOMAIN }}
+          VITE_COGNITO_REDIRECT_URI: ${{ vars.VITE_COGNITO_REDIRECT_URI }}
+          VITE_COGNITO_LOGOUT_URI: ${{ vars.VITE_COGNITO_LOGOUT_URI }}
+          VITE_COGNITO_SCOPES: ${{ vars.VITE_COGNITO_SCOPES }}
+
+      # The app is server-rendered, so the zip carries the package manifests next to build/ as
+      # well: unpack it, `npm ci --omit=dev`, `npm run start`. build/client on its own is not
+      # servable — with `ssr: true` the build emits no HTML at all, so every document response
+      # has to come from build/server/index.js.
+      - name: Package the bundle
+        run: zip -r --quiet ../hermes-frontend.zip build package.json package-lock.json
+
+      - name: Upload the frontend bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-frontend
+          path: hermes-frontend.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # --- 4. Release -----------------------------------------------------------------------------
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-dns-image, build-management-image, build-frontend-image, build-frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download the DNS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hermes-dns-linux-x86_64
+          path: assets
+
+      - name: Download the frontend bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: hermes-frontend
+          path: assets
+
+      - name: Name the assets after the tag
+        run: |
+          set -euo pipefail
+          cd assets
+          chmod +x hermes
+          mv hermes "hermes-dns-${GITHUB_REF_NAME}-x86_64-linux"
+          mv hermes-frontend.zip "hermes-frontend-${GITHUB_REF_NAME}.zip"
+          sha256sum * > SHA256SUMS
+          ls -l
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          repo_lc=${GITHUB_REPOSITORY,,}
+          version=${TAG#v}
+
+          # gh refuses --generate-notes alongside --notes-file, so fetch the generated changelog
+          # through the API and append it to the hand-written part.
+          changelog=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="${TAG}" --jq .body 2>/dev/null || echo "")
+
+          {
+            echo "## Container images"
+            echo
+            echo '```'
+            echo "docker pull ghcr.io/${repo_lc}/dns:${version}"
+            echo "docker pull ghcr.io/${repo_lc}/management:${version}"
+            echo "docker pull ghcr.io/${repo_lc}/frontend:${version}"
+            echo '```'
+            echo
+            echo "## Assets"
+            echo
+            echo "- \`hermes-dns-${TAG}-x86_64-linux\` — the DNS server binary for x86_64 Linux."
+            echo "  Built against glibc 2.36 (Debian bookworm), so it runs on Ubuntu 22.04 and newer."
+            echo "  It takes the server and zones config as arguments:"
+            echo "  \`./hermes-dns-${TAG}-x86_64-linux server.toml zones.toml\`"
+            echo "- \`hermes-frontend-${TAG}.zip\` — the built dashboard (\`build/\`) plus the package"
+            echo "  manifests. Unpack it, run \`npm ci --omit=dev\`, then \`npm run start\`."
+            echo "- \`SHA256SUMS\` — checksums for the two files above."
+            echo
+            if [ -n "${changelog}" ]; then
+              echo "${changelog}"
+            fi
+          } > notes.md
+
+          # A tag such as v1.0.0-rc.1 is a prerelease.
+          prerelease=()
+          case "${version}" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+
+          gh release create "${TAG}" \
+            --title "Hermes ${TAG}" \
+            --notes-file notes.md \
+            --verify-tag \
+            "${prerelease[@]}" \
+            assets/*
