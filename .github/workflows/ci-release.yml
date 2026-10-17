@@ -1,24 +1,42 @@
-# Tests, container images and releases for the three Hermes components.
+# Publishes a version of Hermes. Two ways to start it, both naming the same thing:
 #
-# On every push and pull request: the Rust DNS workspace and the .NET management backend are
-# tested, then all three container images (DNS, management API, dashboard) are built and the
-# frontend is bundled separately as a zip. Images are pushed to GHCR on anything that is not a
-# pull request (a fork's token cannot write packages anyway).
+#   * push a branch called `release/v<version>`, e.g. `release/v1.4.0`
+#   * run it from the Actions tab and type the version into the form
 #
-# Pushing a `v*` tag additionally publishes a GitHub release carrying the Linux DNS binary and a
-# zip of the built frontend. The binary is lifted out of the image that was just pushed, so the
-# release and the image are the same build rather than two compiles that happen to agree.
-name: CI & Release
+# Either way the version is the single source of truth: it names the image tags, the git tag and
+# the release. The `prepare` job resolves it from whichever source fired and validates it, so a
+# typo or an already-published version fails in seconds rather than after a full build.
+#
+# In order: the Rust DNS workspace and the .NET management backend are tested, then all three
+# container images (DNS, management API, dashboard) are built and pushed to GHCR and the frontend
+# is bundled as a zip. Finally a GitHub release is cut at the commit being published, carrying the
+# Linux DNS binary and that zip. The binary is lifted out of the image that was just pushed, so
+# the release and the image are the same build rather than two compiles that happen to agree.
+#
+# Pushing again to an existing release/v* branch re-runs the publish. That is the way to retry a
+# run that failed partway: the git tag is only created in the very last job, so a failed attempt
+# leaves nothing behind to collide with. Once a version has actually been published, a re-run
+# stops at the duplicate check in `prepare`.
+name: Publish
 
 on:
+  push:
+    branches: ["release/v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, without a leading v — e.g. 1.4.0, or 1.4.0-rc.1 for a prerelease"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+# Queue rather than cancel: a half-pushed set of images is worse than a slow one. Keyed by the
+# version being published, so 1.4.1 does not wait behind an unrelated 1.5.0 run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -36,6 +54,88 @@ env:
   DOTNET_CLI_TELEMETRY_OPTOUT: "true"
 
 jobs:
+  # --- 0. Version -----------------------------------------------------------------------------
+  # Runs first and takes seconds, so a typo'd version or an already-published one fails the run
+  # before any Rust compile or image build has started.
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      major_minor: ${{ steps.resolve.outputs.major_minor }}
+      stable: ${{ steps.resolve.outputs.stable }}
+    steps:
+      - name: Resolve and check the version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          BRANCH: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Manual dispatch wins; otherwise the version comes out of the branch name that
+          # triggered the push, release/v1.4.0 -> 1.4.0.
+          if [ -n "${INPUT_VERSION}" ]; then
+            raw=$INPUT_VERSION
+            source="the workflow_dispatch input"
+          else
+            raw=${BRANCH#release/}
+            source="branch $BRANCH"
+          fi
+
+          # Tolerate a leading v and stray whitespace from the dispatch form.
+          raw=$(echo "$raw" | tr -d '[:space:]')
+          version=${raw#v}
+          version=${version#V}
+
+          # No build metadata (`+sha`): a plus sign is legal in semver but not in a Docker tag,
+          # and these versions have to work as both.
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Could not read a usable version from ${source}: '${raw}'. Expected MAJOR.MINOR.PATCH with an optional prerelease suffix, so a branch named release/v1.4.0 or release/v1.4.0-rc.1."
+            exit 1
+          fi
+
+          tag="v${version}"
+          core=${version%%-*}
+          major_minor=${core%.*}
+
+          # A prerelease publishes only its exact version: it must not move `latest` or the
+          # `major.minor` alias onto an untested build.
+          stable=true
+          case "$version" in
+            *-*) stable=false ;;
+          esac
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Pick a new version, or delete that release first."
+            exit 1
+          fi
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" > /dev/null 2>&1; then
+            echo "::error::Tag $tag already exists. This workflow creates the tag at the commit it runs on, so publishing would silently use the existing tag's commit instead. Delete the tag or pick a new version."
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "major_minor=$major_minor"
+            echo "stable=$stable"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Publishing \`$tag\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`$version\` |"
+            echo "| Taken from | $source |"
+            echo "| Image tags | \`$version\`$([ "$stable" = true ] && echo ", \`$major_minor\`, \`latest\`") |"
+            echo "| Prerelease | $([ "$stable" = true ] && echo "no" || echo "yes") |"
+            echo "| Commit | \`$GITHUB_SHA\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # --- 1. Tests -------------------------------------------------------------------------------
   test-dns:
     name: Test DNS crates
@@ -108,7 +208,7 @@ jobs:
   # --- 2. Images ------------------------------------------------------------------------------
   build-dns-image:
     name: Build & push DNS image
-    needs: test-dns
+    needs: [prepare, test-dns]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -119,7 +219,6 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -132,15 +231,14 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.DNS_IMAGE }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.major_minor }},enable=${{ needs.prepare.outputs.stable == 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.stable == 'true' }}
             type=sha,format=long
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=Hermes DNS
             org.opencontainers.image.description=Hermes authoritative DNS server
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
 
       # `load` only, deliberately: buildx refuses to export to the local daemon and to a registry
       # in the same build, and the release binary has to come out of this image rather than from a
@@ -173,7 +271,6 @@ jobs:
           sha256sum hermes
 
       - name: Push the image
-        if: github.event_name != 'pull_request'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
@@ -197,7 +294,7 @@ jobs:
 
   build-management-image:
     name: Build & push management image
-    needs: test-management
+    needs: [prepare, test-management]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -208,7 +305,6 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -221,22 +317,21 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.MGMT_IMAGE }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.major_minor }},enable=${{ needs.prepare.outputs.stable == 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.stable == 'true' }}
             type=sha,format=long
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=Hermes management API
             org.opencontainers.image.description=Hermes management backend serving the dashboard and the DNS fleet
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: management-backend
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=management
@@ -244,6 +339,7 @@ jobs:
 
   build-frontend-image:
     name: Build & push frontend image
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -254,7 +350,6 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -267,15 +362,14 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.major_minor }},enable=${{ needs.prepare.outputs.stable == 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.stable == 'true' }}
             type=sha,format=long
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=Hermes dashboard
             org.opencontainers.image.description=Hermes management dashboard, server-rendered by react-router-serve
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
 
       # This image runs its own `npm run build` inside the Dockerfile, so it does not reuse the
       # bundle from build-frontend. The VITE_* values are inlined into the client bundle at build
@@ -287,7 +381,7 @@ jobs:
         with:
           context: frontend
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -306,6 +400,7 @@ jobs:
   # --- 3. Frontend bundle ---------------------------------------------------------------------
   build-frontend:
     name: Build frontend bundle
+    needs: prepare
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -356,8 +451,7 @@ jobs:
   # --- 4. Release -----------------------------------------------------------------------------
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-dns-image, build-management-image, build-frontend-image, build-frontend]
+    needs: [prepare, build-dns-image, build-management-image, build-frontend-image, build-frontend]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -376,24 +470,28 @@ jobs:
           name: hermes-frontend
           path: assets
 
-      - name: Name the assets after the tag
+      - name: Name the assets after the version
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           cd assets
           chmod +x hermes
-          mv hermes "hermes-dns-${GITHUB_REF_NAME}-x86_64-linux"
-          mv hermes-frontend.zip "hermes-frontend-${GITHUB_REF_NAME}.zip"
+          mv hermes "hermes-dns-${TAG}-x86_64-linux"
+          mv hermes-frontend.zip "hermes-frontend-${TAG}.zip"
           sha256sum * > SHA256SUMS
           ls -l
 
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STABLE: ${{ needs.prepare.outputs.stable }}
         run: |
           set -euo pipefail
           repo_lc=${GITHUB_REPOSITORY,,}
-          version=${TAG#v}
+          version=$VERSION
 
           # gh refuses --generate-notes alongside --notes-file, so fetch the generated changelog
           # through the API and append it to the hand-written part.
@@ -424,15 +522,22 @@ jobs:
             fi
           } > notes.md
 
-          # A tag such as v1.0.0-rc.1 is a prerelease.
           prerelease=()
-          case "${version}" in
-            *-*) prerelease=(--prerelease) ;;
-          esac
+          if [ "$STABLE" != "true" ]; then
+            prerelease=(--prerelease)
+          fi
 
+          # --target creates the tag at the commit being published; the tag does not exist yet,
+          # which `prepare` has already confirmed.
           gh release create "${TAG}" \
             --title "Hermes ${TAG}" \
             --notes-file notes.md \
-            --verify-tag \
+            --target "${GITHUB_SHA}" \
             "${prerelease[@]}" \
             assets/*
+
+          {
+            echo "### Published [\`$TAG\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG})"
+            echo
+            echo "Tagged \`${GITHUB_SHA}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
